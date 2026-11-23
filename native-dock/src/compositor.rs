@@ -1370,7 +1370,7 @@ impl Buffer {
         group: Option<(Vec<crate::fusion::geometry::Pane>, [f32; 2])>,
         moving: bool,
     ) {
-        let skip_rim = group.is_none() && moving && crate::motion::low_power();
+        let skip_rim = group.is_none() && moving && crate::motion::reduce_on_drag();
         if skip_rim {
             return;
         }

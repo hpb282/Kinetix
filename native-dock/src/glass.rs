@@ -1032,7 +1032,8 @@ impl Glass {
         }
         let window = crate::fusion::window_rect(hwnd);
         let moving = crate::fusion::is_moving(hwnd) || is_resizing(hwnd);
-        let low_moving = moving && crate::motion::low_power();
+        let low_moving = (moving && crate::motion::low_power())
+            || (crate::motion::reduce_on_drag() && crate::fusion::is_moving(hwnd));
         if self.style == 0 || self.style == 6 {
             PatBlt(dc, 0, 0, width, height, BLACKNESS);
         }
@@ -1065,7 +1066,8 @@ impl Glass {
         };
         let window = crate::fusion::window_rect(hwnd);
         let moving = crate::fusion::is_moving(hwnd) || is_resizing(hwnd);
-        let low_moving = moving && crate::motion::low_power();
+        let low_moving = (moving && crate::motion::low_power())
+            || (crate::motion::reduce_on_drag() && crate::fusion::is_moving(hwnd));
         let apply_liquid = liquid_glass() && !low_moving && !crate::fusion::is_surface(hwnd);
         if self.style == 0 || self.style == 6 {
             PatBlt(dc, 0, 0, width, height, BLACKNESS);

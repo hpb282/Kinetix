@@ -1,26 +1,36 @@
-**Kinetix 0.2.0**: first release under the Kinetix name.
+**Kinetix 0.2.1**: smoothness and battery release.
 
-- **New name and icon**: the app, window titles, tray menu, notifications,
-  executable (`Kinetix.exe`) and package (`Kinetix-0.2.0-windows-x86_64.zip`)
-  are now Kinetix, with a new icon.
-- **Auto low-power on battery** (General Settings, on by default): while you're
-  unplugged or Battery Saver is on, animations run at a lower frame rate, blur and
-  caches shrink, and freed memory goes back to Windows. Normal mode returns
-  automatically when you plug in.
-- **Lighter Music browser**: the hidden Chrome/Edge player turns off background
-  features it doesn't use, and in low-power mode it may be throttled while paused.
-- **Security**: the Music widget no longer opens a browser while Kinetix is running
-  as administrator, and the update helper only overwrites an existing `kinetix.exe`.
+Measured on a laptop running the Clock (afterglow), Music, Calendar, Control
+Center and App Dock widgets together, at 2880×1800 and 175% scaling:
 
-Tiếng Việt: Kinetix 0.2.0 có tên và icon mới, tự bật tiết kiệm pin khi rút sạc,
-widget Music nhẹ hơn, và vá 2 lỗi bảo mật. Chi tiết: `docs/laptop-optimization-vi.md`.
+| | 0.2.0 | 0.2.1 |
+| --- | --- | --- |
+| Idle CPU (share of one core) | ~30% | ~7% |
+| Resident memory after 90 s in the background | ~190 MB (grew to ~370 MB with use) | ~18 MB |
 
-**Install:** download `Kinetix-0.2.0-windows-x86_64.zip`, extract the whole ZIP
-to a writable folder (not Program Files) and run `Kinetix.exe`. You don't need to
-install Python, Node or Rust. Music playback needs Chrome or Edge and an internet
-connection. Kinetix stores its settings in its own folder, separately from Lumen.
+- **Clock**: the "afterglow" sun/moon animation repainted the whole glass widget
+  at the display refresh rate (up to 120 fps) and kept Windows' 1 ms timer
+  resolution active, even though its motion is only a few pixels per second.
+  It now runs at 20 fps with the normal system timer.
+- **Music**: while a track plays, the widget repainted four times a second.
+  It now repaints immediately when the track, cover or playback state changes,
+  and at most once a second for the progress bar.
+- **Widgets no longer vanish when you click the desktop**: widgets now stay
+  directly above the desktop when Windows reshuffles windows, and they re-pin
+  as soon as focus changes. Previously some only fixed themselves on a timer,
+  up to 60 s later for the Calendar.
+- **Smoother dragging**: while you drag a widget, its glass uses the light
+  frosted style, then full liquid glass returns when you drop it. Redrawing
+  liquid glass took 13–33 ms per frame, over the 8 ms budget at 120 Hz.
+- **Lower memory**: while you use other apps, Kinetix returns its unused
+  memory to Windows, at most every 90 s.
 
-Requires Windows 10/11 x64. The exe is not code-signed, so SmartScreen may warn
-about an unknown publisher.
+Tiếng Việt: bản 0.2.1 giảm CPU khi rảnh từ ~30% xuống ~7% một nhân, RAM thường trú
+còn ~18 MB, widget không còn biến mất khi bấm ra desktop, kéo widget mượt hơn.
+
+**Install:** download `Kinetix-0.2.1-windows-x86_64.zip`, extract the whole ZIP
+to a writable folder (not Program Files) and run `Kinetix.exe`. Requires
+Windows 10/11 x64. The exe is not code-signed, so SmartScreen may warn about an
+unknown publisher.
 
 Based on [Lumen](https://github.com/nhatnguyends/Lumen) by Nhat Ng (MIT).

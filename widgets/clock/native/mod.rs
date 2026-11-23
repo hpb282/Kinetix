@@ -366,9 +366,11 @@ impl State {
             IsWindowVisible(self.hwnd) != 0 && IsIconic(self.hwnd) == 0,
             self.moving,
         ) {
-            if self.anim_clock.is_none() {
-                self.anim_clock = Some(crate::motion::FrameClock::start());
-            }
+            // Timer-driven at AFTERGLOW_FRAME_MS only: no 1 ms system timer
+            // resolution (FrameClock) and no vsync re-invalidate chain, which
+            // previously repainted the whole glass window at the display rate.
+            self.anim_clock = None;
+            self.frame_queued = false;
             SetTimer(self.hwnd, ANIMATION, ms, None);
         } else {
             self.anim_clock = None;
@@ -445,7 +447,7 @@ impl State {
             self.config.frost_strength,
             self.glass.borrow().revision(),
             crate::fusion::revision(self.hwnd),
-            crate::motion::low_power() && crate::fusion::is_moving(self.hwnd)
+            crate::motion::reduce_on_drag() && crate::fusion::is_moving(self.hwnd)
         )
     }
     /// Sample the shared wallpaper source via the shared Glass instance.

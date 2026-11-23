@@ -50,13 +50,18 @@ pub(super) fn content_key(
         muted
     )
 }
+/// Afterglow motion is extremely slow (a ~2 px bob over 9 s, rays turning once
+/// per 70 s): at 120 Hz each frame moves ~0.01 px, so full-rate repaints of the
+/// whole glass window burned ~25% of a CPU core for no visible gain. 20 fps keeps
+/// it smooth (<0.35 px per frame) at a sixth of the cost.
+pub(super) const AFTERGLOW_FRAME_MS: u32 = 50;
 pub(super) fn interval(cfg: &Config, visible: bool, moving: bool) -> Option<u32> {
     (visible
         && !moving
         && !crate::motion::low_power()
         && cfg.theme == "sunset"
         && cfg.dynamic_animation)
-        .then(|| crate::motion::frame_interval_ms())
+        .then_some(AFTERGLOW_FRAME_MS)
 }
 fn outline(n: f32) -> Vec<(f32, f32)> {
     let mut points = Vec::with_capacity(83);
@@ -241,10 +246,7 @@ mod tests {
             theme: "sunset".into(),
             ..Config::default()
         };
-        assert_eq!(
-            interval(&c, true, false),
-            Some(crate::motion::frame_interval_ms())
-        );
+        assert_eq!(interval(&c, true, false), Some(AFTERGLOW_FRAME_MS));
         assert_eq!(interval(&c, false, false), None);
         assert_eq!(interval(&c, true, true), None);
         c.dynamic_animation = false;

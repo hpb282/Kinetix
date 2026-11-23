@@ -772,7 +772,7 @@ impl State {
             crate::fusion::revision(self.hwnd),
             self.config.frost_strength,
             self.config.palette,
-            crate::motion::low_power() && crate::fusion::is_moving(self.hwnd)
+            crate::motion::reduce_on_drag() && crate::fusion::is_moving(self.hwnd)
         );
         let backdrop_reusable = self
             .backdrop

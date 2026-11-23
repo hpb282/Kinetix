@@ -26,6 +26,13 @@ pub fn set_auto_low_power(enabled: bool) -> bool {
 pub fn low_power() -> bool {
     LOW_POWER.load(Ordering::Relaxed)
 }
+/// While a widget is being DRAGGED its glass is re-sampled every frame; the
+/// liquid-glass refraction/rim path costs 13-33 ms per frame there (far over a
+/// 120 Hz budget), so drags always use the light frosted path and full quality
+/// returns on drop. Resizing keeps full quality outside low-power mode.
+pub fn reduce_on_drag() -> bool {
+    true
+}
 #[repr(C)]
 struct SystemPowerStatus {
     ac_line_status: u8,

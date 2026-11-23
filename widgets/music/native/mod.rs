@@ -76,6 +76,7 @@ struct State {
     frame: Option<Buffer>,
     spin_base: Option<Buffer>,
     spin_base_key: String,
+    last_progress_paint: Instant,
     spin_disc_rect: Option<[f32; 4]>,
     skip_spin_disc: bool,
     overlay: Option<Image>,
@@ -551,7 +552,12 @@ impl State {
                 dirty = true;
             }
         }
-        if dirty || self.playback.playing {
+        // While playing with no state change, only the progress bar/time moves
+        // (~1 px per second): repaint the full glass widget at most once per second
+        // instead of on every 250 ms poll.
+        let progress_due = self.playback.playing
+            && self.last_progress_paint.elapsed() >= std::time::Duration::from_millis(1000);
+        if dirty || progress_due {
             if dirty {
                 self.sync_spin_timer();
             }
@@ -559,6 +565,7 @@ impl State {
                 if dirty {
                     self.restore_art();
                 }
+                self.last_progress_paint = Instant::now();
                 InvalidateRect(self.hwnd, null(), 0);
             } else if dirty {
                 self.remember_view();
@@ -745,7 +752,7 @@ impl State {
         };
         let (width, height) = (w as f32 / self.dpi, h as f32 / self.dpi);
         let wr = crate::fusion::window_rect(self.hwnd);
-        let low_moving = crate::motion::low_power() && crate::fusion::is_moving(self.hwnd);
+        let low_moving = crate::motion::reduce_on_drag() && crate::fusion::is_moving(self.hwnd);
         let move_backdrop_dirty = crate::glass::frosted_glass()
             && ([wr.left, wr.top] != self.window_origin || low_moving != self.was_low_power_moving);
         if self.background.is_none() || fusion_changed || move_backdrop_dirty {
@@ -1025,6 +1032,7 @@ impl Host {
             frame: None,
             spin_base: None,
             spin_base_key: String::new(),
+            last_progress_paint: Instant::now(),
             spin_disc_rect: None,
             skip_spin_disc: false,
             overlay: None,
@@ -2428,6 +2436,7 @@ mod tests {
                             frame: None,
                             spin_base: None,
                             spin_base_key: String::new(),
+                            last_progress_paint: Instant::now(),
                             spin_disc_rect: None,
                             skip_spin_disc: false,
                             overlay: None,

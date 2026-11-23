@@ -41,3 +41,30 @@ Bản này dựa trên Lumen v0.1.13 (MIT, © 2026 Nhat Ng — https://github.co
 ```
 cargo build --release --locked --manifest-path native-dock/Cargo.toml
 ```
+
+## Bản 0.2.1: sửa giật/lag (đo trên máy thật)
+
+Đo với Clock (afterglow), Music, Calendar, Control Center và App Dock cùng bật,
+màn hình 2880×1800, scale 175%:
+
+| Kịch bản | CPU khi rảnh (% một nhân) |
+|---|---|
+| 0.2.0, cài đặt như người dùng | 30,2% |
+| 0.2.0, tắt hiệu ứng động của Clock | 3,6% |
+| 0.2.1, cài đặt như người dùng | ~7% |
+
+Nguyên nhân và cách sửa:
+
+1. **Clock "afterglow" vẽ lại toàn bộ widget kính ở tần số màn hình (tới 120 fps)**
+   và giữ bộ hẹn giờ 1 ms của Windows, trong khi hình mặt trời/mặt trăng chỉ dịch
+   ~2 px mỗi 9 giây. Giờ chạy 20 fps bằng timer thường (`widgets/clock/native/afterglow.rs`).
+2. **Music vẽ lại 4 lần/giây khi đang phát nhạc** dù chỉ thanh tiến trình nhích ~1 px/giây.
+   Giờ vẽ ngay khi đổi bài/ảnh/trạng thái, còn tiến trình tối đa 1 lần/giây.
+3. **Widget biến mất khi bấm/chuột phải ra desktop**: vị trí "neo" trên/dưới bị tính theo
+   cả các cửa sổ ẩn (cloaked) và có thể rơi xuống dưới desktop; widget chỉ được ghim lại
+   theo timer (Calendar tới 60 giây). Giờ neo tính ngay trên desktop, bỏ qua cửa sổ ẩn,
+   và ghim lại tức thì khi cửa sổ đang chọn thay đổi (`native-dock/src/desktop_layer.rs`).
+4. **Kéo widget bị giật**: liquid glass tốn 13–33 ms/khung khi hình dạng thay đổi
+   (ngân sách 8,3 ms ở 120 Hz). Khi kéo, kính dùng kiểu frosted nhẹ; thả ra thì về đầy đủ.
+5. **RAM tăng dần theo thời gian sử dụng** (~370 MB): khi bạn dùng app khác, Kinetix trả bộ nhớ
+   không dùng cho Windows tối đa mỗi 90 giây → RAM thường trú còn ~18 MB.

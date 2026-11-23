@@ -1758,7 +1758,7 @@ impl State {
             self.board.frost_strength,
             source_glass.borrow().revision(),
             crate::fusion::revision(self.hwnd),
-            crate::motion::low_power() && crate::fusion::is_moving(self.hwnd)
+            crate::motion::reduce_on_drag() && crate::fusion::is_moving(self.hwnd)
         );
         let cached = self
             .background

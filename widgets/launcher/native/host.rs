@@ -1790,7 +1790,7 @@ impl App {
             self.glass.borrow().revision(),
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
             crate::fusion::revision(hwnd),
-            crate::motion::low_power() && crate::fusion::is_moving(hwnd)
+            crate::motion::reduce_on_drag() && crate::fusion::is_moving(hwnd)
         );
         let cached = self.background.as_ref().is_some_and(|b| {
             b.width == client.right && b.height == client.bottom && b.dpi == self.dpi
@@ -2072,7 +2072,7 @@ impl App {
                 search_accent,
                 search_light,
                 self.dock.opacity,
-                moving && crate::motion::low_power(),
+                moving && crate::motion::reduce_on_drag(),
                 true,
             );
         }
@@ -2646,6 +2646,36 @@ unsafe fn font(height: i32, bold: bool) -> HFONT {
         DEFAULT_PITCH as u32,
         wide("Segoe UI Variable Text").as_ptr(),
     )
+}
+/// Drag/hover/redraw caches stay resident after use (a long session grew to
+/// ~370 MB). While the user works in another app, hand pages that are no longer
+/// touched back to Windows at most every 90 s; anything still drawn (e.g. the
+/// clock) simply faults back in from the standby list.
+unsafe fn trim_memory_when_idle() {
+    use windows_sys::Win32::System::{
+        Memory::SetProcessWorkingSetSizeEx,
+        Threading::{GetCurrentProcess, GetCurrentProcessId},
+    };
+    thread_local! {
+        static LAST_TRIM: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
+    let now = std::time::Instant::now();
+    let Some(last) = LAST_TRIM.with(|t| t.get()) else {
+        LAST_TRIM.with(|t| t.set(Some(now)));
+        return;
+    };
+    if now.duration_since(last) < INTERVAL {
+        return;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
+    if pid == GetCurrentProcessId() || GetCapture() != null_mut() {
+        return; // user is interacting with Kinetix right now
+    }
+    LAST_TRIM.with(|t| t.set(Some(now)));
+    SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0);
 }
 pub(crate) unsafe fn apply_window_mode(hwnd: HWND, _floating: bool, inspect: bool) {
     crate::desktop_layer::register(hwnd, !inspect);
@@ -3831,6 +3861,7 @@ unsafe extern "system" fn wndproc(
                 crate::general::apply_low_power_change();
                 app.notify_wallpaper_changed(hwnd);
             }
+            trim_memory_when_idle();
             app.sync_desktop_items(hwnd);
             let (update_actions, has_update, updating) = if let Some(host) = &mut app.general {
                 (host.poll_update(), host.has_update(), host.is_updating())
