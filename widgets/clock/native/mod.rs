@@ -1,0 +1,1067 @@
+//! Native Clock, with a detached shared-kit settings window and compact faces.
+#[path = "afterglow.rs"]
+mod afterglow;
+mod face;
+mod model;
+#[path = "settings.rs"]
+mod settings;
+#[path = "visuals.rs"]
+mod visuals;
+use crate::{
+    compositor::{Buffer, WindowShadow},
+    glass::Glass,
+    model::wide,
+    render::{self, Canvas},
+};
+use model::*;
+use std::{
+    cell::RefCell,
+    mem::{size_of, zeroed},
+    path::{Path, PathBuf},
+    ptr::{null, null_mut},
+    rc::Rc,
+};
+use windows_sys::Win32::{
+    Foundation::*,
+    Graphics::Gdi::*,
+    System::{LibraryLoader::GetModuleHandleW, Time::DYNAMIC_TIME_ZONE_INFORMATION},
+    UI::{
+        HiDpi::*,
+        Input::KeyboardAndMouse::{
+            ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+        },
+        WindowsAndMessaging::*,
+    },
+};
+const TICK: usize = 71;
+const ANIMATION: usize = 72;
+const WALLPAPER_READY: u32 = WM_APP + 61;
+pub struct Host {
+    state: Box<RefCell<State>>,
+}
+struct State {
+    hwnd: HWND,
+    root: PathBuf,
+    config: Config,
+    zone: Option<DYNAMIC_TIME_ZONE_INFORMATION>,
+    glass: Rc<RefCell<Glass>>,
+    dpi: f32,
+    inspect: bool,
+    smoke: bool,
+    moving: bool,
+    resizing: bool,
+    frame: Option<Buffer>,
+    background: Option<Buffer>,
+    key: String,
+    shadow: Option<WindowShadow>,
+    ink: u32,
+    muted: u32,
+    pressed: Option<usize>,
+    hover: Option<usize>,
+    error: String,
+    settings: Option<crate::settings_ui::Host>,
+    theme_texture: Option<(String, render::Image)>,
+    afterglow_content: Option<(String, render::Image)>,
+    anim_clock: Option<crate::motion::FrameClock>,
+    frame_queued: bool,
+}
+pub fn should_open(root: &Path) -> bool {
+    root.join("config/native-clock.json").exists()
+        && Config::load(root).map(|c| c.open).unwrap_or(false)
+}
+impl Host {
+    pub unsafe fn create(
+        root: &Path,
+        glass: Rc<RefCell<Glass>>,
+        inspect: bool,
+        smoke: bool,
+    ) -> Result<Self, String> {
+        let mut config = Config::load(root)?;
+        config.time_zone = "local".into();
+        let zone = zone(&config.time_zone)?;
+        let class = wide("KinetixNativeClockWindow");
+        let instance = GetModuleHandleW(null());
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(proc),
+            hInstance: instance,
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            lpszClassName: class.as_ptr(),
+            ..zeroed()
+        };
+        if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let dpi = GetDpiForSystem() as f32 / 96.;
+        let size = config.size.map(|v| (v as f32 * dpi).round() as i32);
+        let mut work: RECT = zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as _, 0);
+        let pos = config.position.unwrap_or([work.left + 72, work.top + 72]);
+        let bounds = RECT {
+            left: pos[0],
+            top: pos[1],
+            right: pos[0] + size[0],
+            bottom: pos[1] + size[1],
+        };
+        let monitor = MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(monitor, &mut info);
+        let min_px = [(MIN_SIZE as f32 * dpi).round() as i32; 2];
+        let clamped = crate::geometry::clamp_rect_to_work(
+            [bounds.left, bounds.top, bounds.right, bounds.bottom],
+            [
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
+            ],
+            min_px,
+        );
+        let (x, y, size) = (
+            clamped[0],
+            clamped[1],
+            [clamped[2] - clamped[0], clamped[3] - clamped[1]],
+        );
+        let mut state = Box::new(RefCell::new(State {
+            hwnd: null_mut(),
+            root: root.into(),
+            config,
+            zone,
+            glass,
+            dpi,
+            inspect,
+            smoke,
+            moving: false,
+            resizing: false,
+            frame: None,
+            background: None,
+            key: String::new(),
+            shadow: None,
+            ink: 0xfdfaf8,
+            muted: 0xd7cac1,
+            pressed: None,
+            hover: None,
+            error: String::new(),
+            settings: None,
+            theme_texture: None,
+            afterglow_content: None,
+            anim_clock: None,
+            frame_queued: false,
+        }));
+        let hwnd = CreateWindowExW(
+            crate::gpu::window_ex_style()
+                | if inspect {
+                    WS_EX_APPWINDOW
+                } else {
+                    WS_EX_TOOLWINDOW
+                },
+            class.as_ptr(),
+            wide("Kinetix · Native Clock").as_ptr(),
+            WS_POPUP,
+            x,
+            y,
+            size[0],
+            size[1],
+            null_mut(),
+            null_mut(),
+            instance,
+            &mut *state as *mut _ as _,
+        );
+        if hwnd.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        state.borrow_mut().hwnd = hwnd;
+        let (live_dpi, _) =
+            crate::geometry::clamp_window_to_work(hwnd, [MIN_SIZE, MIN_SIZE], dpi);
+        state.borrow_mut().dpi = live_dpi;
+        println!(
+            "native-clock-created pid={} theme={} shared_wallpaper=true",
+            std::process::id(),
+            state.borrow().config.theme
+        );
+        Ok(Self { state })
+    }
+    pub fn hwnd(&self) -> HWND {
+        self.state.borrow().hwnd
+    }
+    pub unsafe fn is_visible(&self) -> bool {
+        IsWindowVisible(self.hwnd()) != 0
+    }
+    pub unsafe fn hide(&mut self) {
+        self.state.borrow_mut().action(1);
+    }
+    pub unsafe fn show_settings(&mut self) {
+        self.state.borrow_mut().open_settings();
+    }
+    pub unsafe fn apply_common(&mut self, opacity: Option<f32>, floating: Option<bool>) {
+        let (hwnd, topmost, inspect) = {
+            let mut s = self.state.borrow_mut();
+            if let Some(v) = opacity.filter(|v| v.is_finite()) {
+                s.config.opacity = v.clamp(0., 100.);
+            }
+            if let Some(v) = floating {
+                s.config.floating = v;
+            }
+            s.key.clear();
+            s.save();
+            s.sync_settings();
+            (s.hwnd, s.config.floating, s.inspect)
+        };
+        if floating.is_some() {
+            crate::window::apply_window_mode(hwnd, topmost, inspect);
+        }
+        if IsWindowVisible(hwnd) != 0 {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
+    pub unsafe fn show(&mut self) {
+        let hwnd = self.hwnd();
+        {
+            let mut s = self.state.borrow_mut();
+            if !crate::multi_monitor::is_duplicate(hwnd) {
+                s.config.open = true;
+                s.save_local();
+            }
+            s.pressed = None;
+            s.hover = None;
+            s.key.clear();
+        }
+        let (floating, inspect) = {
+            let s = self.state.borrow();
+            (s.config.floating, s.inspect)
+        };
+        ShowWindow(hwnd, if inspect { SW_SHOW } else { SW_SHOWNOACTIVATE });
+        crate::window::apply_window_mode(hwnd, floating, inspect);
+        let mut s = self.state.borrow_mut();
+        s.arm();
+        s.paint();
+    }
+    pub unsafe fn refresh(&mut self) {
+        let s = self.state.borrow_mut();
+        if IsWindowVisible(s.hwnd) != 0 {
+            if !s.moving && s.background_key() != s.key {
+                InvalidateRect(s.hwnd, null(), 0);
+            }
+            if !s.config.floating && !s.inspect {
+                crate::window::pin_to_desktop(s.hwnd);
+            }
+        }
+    }
+}
+impl Drop for Host {
+    fn drop(&mut self) {
+        unsafe {
+            self.state.borrow_mut().settings.take();
+            let hwnd = self.hwnd();
+            if IsWindow(hwnd) != 0 {
+                DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+#[derive(Clone)]
+struct Button {
+    id: usize,
+    r: [f32; 4],
+}
+impl State {
+    unsafe fn dimensions(&self) -> (f32, f32) {
+        let mut r = zeroed();
+        GetClientRect(self.hwnd, &mut r);
+        (r.right as f32 / self.dpi, r.bottom as f32 / self.dpi)
+    }
+    unsafe fn buttons(&self) -> Vec<Button> {
+        let (w, _) = self.dimensions();
+        crate::settings_ui::widget_header_hits(w)
+            .into_iter()
+            .map(|(a, r)| Button {
+                id: if a == crate::settings_ui::HeaderAction::Settings {
+                    0
+                } else {
+                    1
+                },
+                r,
+            })
+            .collect()
+    }
+    unsafe fn hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.buttons()
+            .iter()
+            .find(|b| x >= b.r[0] && x <= b.r[2] && y >= b.r[1] && y <= b.r[3])
+            .map(|b| b.id)
+    }
+    unsafe fn save_local(&mut self) {
+        if !self.smoke {
+            if let Err(e) = self.config.save(&self.root) {
+                eprintln!("native-clock-save: {e}");
+                self.error = e;
+            }
+        }
+    }
+    unsafe fn save(&mut self) {
+        if self.smoke {
+            return;
+        }
+        let res = if crate::multi_monitor::is_duplicate(self.hwnd) {
+            let mut shared = self.config.clone();
+            if let Ok(disk) = Config::load(&self.root) {
+                shared.position = disk.position;
+                shared.size = disk.size;
+                shared.open = disk.open;
+            }
+            shared.save(&self.root)
+        } else {
+            self.config.save(&self.root)
+        };
+        match res {
+            Ok(()) => crate::multi_monitor::notify_peers("clock", self.hwnd),
+            Err(e) => {
+                eprintln!("native-clock-save: {e}");
+                self.error = e;
+            }
+        }
+    }
+    unsafe fn save_bounds(&mut self) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+            return;
+        }
+        let mut r = zeroed();
+        GetWindowRect(self.hwnd, &mut r);
+        self.config.position = Some([r.left, r.top]);
+        self.config.size = [
+            ((r.right - r.left) as f32 / self.dpi).round() as i32,
+            ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
+        ];
+        self.save_local();
+    }
+    unsafe fn reload_from_shared(&mut self) {
+        let Ok(mut loaded) = Config::load(&self.root) else {
+            return;
+        };
+        loaded.position = self.config.position;
+        loaded.size = self.config.size;
+        loaded.open = self.config.open;
+        if loaded.time_zone != self.config.time_zone {
+            if let Ok(z) = zone(&loaded.time_zone) {
+                self.zone = z;
+            }
+        }
+        let floating_changed = loaded.floating != self.config.floating;
+        self.config = loaded;
+        self.key.clear();
+        self.background = None;
+        self.theme_texture = None;
+        self.afterglow_content = None;
+        self.arm();
+        if floating_changed {
+            crate::window::apply_window_mode(self.hwnd, self.config.floating, self.inspect);
+        }
+        self.sync_settings();
+        InvalidateRect(self.hwnd, null(), 0);
+    }
+    unsafe fn arm_animation(&mut self) {
+        KillTimer(self.hwnd, ANIMATION);
+        if let Some(ms) = afterglow::interval(
+            &self.config,
+            IsWindowVisible(self.hwnd) != 0 && IsIconic(self.hwnd) == 0,
+            self.moving,
+        ) {
+            if self.anim_clock.is_none() {
+                self.anim_clock = Some(crate::motion::FrameClock::start());
+            }
+            SetTimer(self.hwnd, ANIMATION, ms, None);
+        } else {
+            self.anim_clock = None;
+        }
+    }
+    unsafe fn arm(&mut self) {
+        KillTimer(self.hwnd, TICK);
+        self.arm_animation();
+        if IsWindowVisible(self.hwnd) != 0 {
+            let t = model::now(&self.zone);
+            let period = if self.config.show_seconds {
+                1000
+            } else {
+                60000
+            };
+            let elapsed = if self.config.show_seconds {
+                t.wMilliseconds as u32
+            } else {
+                t.wSecond as u32 * 1000 + t.wMilliseconds as u32
+            };
+            SetTimer(self.hwnd, TICK, (period - elapsed).max(10), None);
+        }
+    }
+    unsafe fn action(&mut self, id: usize) {
+        match id {
+            0 => {
+                self.open_settings();
+                return;
+            }
+            1 => {
+                let was_visible = IsWindowVisible(self.hwnd) != 0;
+                if !crate::multi_monitor::is_duplicate(self.hwnd) {
+                    self.config.open = false;
+                }
+                self.save_bounds();
+                KillTimer(self.hwnd, TICK);
+                KillTimer(self.hwnd, ANIMATION);
+                self.anim_clock = None;
+                self.frame_queued = false;
+                self.shadow.take();
+                ShowWindow(self.hwnd, SW_HIDE);
+                self.frame = None;
+                self.background = None;
+                self.theme_texture = None;
+                self.afterglow_content = None;
+                if was_visible && !self.smoke {
+                    crate::multi_monitor::request_hide_widget("clock");
+                }
+                return;
+            }
+            10..=18 => self.config.theme = THEMES[id - 10].0.into(),
+            _ => return,
+        }
+        self.key.clear();
+        self.arm_animation();
+        self.save();
+        self.sync_settings();
+        InvalidateRect(self.hwnd, null(), 0);
+    }
+    unsafe fn background_key(&self) -> String {
+        let frosted = crate::glass::frosted_glass();
+        let r = crate::fusion::window_rect(self.hwnd);
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            if frosted { r.left } else { 0 },
+            if frosted { r.top } else { 0 },
+            r.right - r.left,
+            r.bottom - r.top,
+            self.dpi,
+            self.config.theme,
+            self.config.palette,
+            frosted,
+            self.config.tint,
+            self.config.frost_strength,
+            self.glass.borrow().revision(),
+            crate::fusion::revision(self.hwnd),
+            crate::motion::low_power() && crate::fusion::is_moving(self.hwnd)
+        )
+    }
+    /// Sample the shared wallpaper source via the shared Glass instance.
+    unsafe fn draw_frost(&mut self, dc: HDC, w: i32, h: i32) {
+        self.glass.borrow().draw_blended(
+            dc,
+            self.hwnd,
+            w,
+            h,
+            (self.config.frost_strength * 2.55).round() as u8,
+        );
+    }
+    /// Cache time/date/typography once per displayed second (or minute).
+    /// Animation frames draw only the vector emblem over this native-size sprite.
+    unsafe fn paint_content(&mut self, dc: HDC, w: f32, h: f32) {
+        let now = model::now(&self.zone);
+        self.paint_content_at(dc, w, h, &now);
+    }
+    unsafe fn paint_content_at(&mut self, dc: HDC, w: f32, h: f32, now: &SYSTEMTIME) {
+        if self.config.theme != "sunset" {
+            self.afterglow_content = None;
+            face::draw(
+                &Canvas::new(dc, self.dpi),
+                &self.config,
+                &now,
+                w,
+                h,
+                self.ink,
+                self.muted,
+            );
+            return;
+        }
+        let key = afterglow::content_key(&self.config, &now, w, h, self.dpi, self.ink, self.muted);
+        if self
+            .afterglow_content
+            .as_ref()
+            .is_none_or(|(k, _)| *k != key)
+        {
+            if let Some(layer) = Buffer::plain(
+                (w * self.dpi).round() as i32,
+                (h * self.dpi).round() as i32,
+                self.dpi,
+            ) {
+                let Some(batch) = render::AlphaBatch::new(layer.dc, self.dpi) else {
+                    self.afterglow_content = None;
+                    let c = Canvas::new(dc, self.dpi);
+                    face::draw_content(&c, &self.config, &now, w, h, self.ink, self.muted, false);
+                    face::draw_afterglow_motion(&c, &self.config, &now, w, h, self.ink);
+                    return;
+                };
+                face::draw_content(
+                    &Canvas::new(layer.dc, self.dpi),
+                    &self.config,
+                    &now,
+                    w,
+                    h,
+                    self.ink,
+                    self.muted,
+                    false,
+                );
+                drop(batch);
+                let mut rgba = layer.snapshot();
+                // Image::from_rgba wraps PARGB. Retain coverage in RGB so cached
+                // glyph edges stay antialiased rather than turning into white fringes.
+                for p in rgba.chunks_exact_mut(4) {
+                    p.swap(0, 2);
+                }
+                self.afterglow_content =
+                    render::Image::from_rgba(layer.width as u32, layer.height as u32, rgba)
+                        .map(|i| (key.clone(), i));
+            }
+        }
+        let c = Canvas::new(dc, self.dpi);
+        match &self.afterglow_content {
+            Some((k, image)) if *k == key => c.image_snapped(image, [0., 0., w, h]),
+            _ => face::draw_content(&c, &self.config, &now, w, h, self.ink, self.muted, false),
+        }
+        face::draw_afterglow_motion(&c, &self.config, &now, w, h, self.ink);
+    }
+    unsafe fn paint(&mut self) {
+        let mut r = zeroed();
+        GetClientRect(self.hwnd, &mut r);
+        if r.right <= 0 || r.bottom <= 0 {
+            return;
+        }
+        crate::fusion::prepare(self.hwnd, 34.);
+        let Some(mut frame) = self
+            .frame
+            .take()
+            .filter(|b| b.matches_geometry(r.right, r.bottom, self.dpi, 34.))
+            .or_else(|| Buffer::new(r.right, r.bottom, self.dpi, 34.))
+        else {
+            return;
+        };
+        let (w, h) = self.dimensions();
+        let fused = crate::fusion::fused(self.hwnd);
+        let pane = if fused {
+            [0., 0., w, h]
+        } else {
+            [4., 4., w - 4., h - 4.]
+        };
+        let radius = if fused { 0. } else { 34. };
+        let key = self.background_key();
+        let reusable = self
+            .background
+            .as_ref()
+            .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
+        if !reusable || key != self.key {
+            let brush = CreateSolidBrush(self.surface_color());
+            FillRect(frame.dc, &r, brush);
+            DeleteObject(brush);
+            let frosted = crate::glass::frosted_glass();
+            let wallpaper_available = self.glass.borrow().available();
+            if frosted && wallpaper_available {
+                self.draw_frost(frame.dc, r.right, r.bottom);
+            }
+            let surface_color = self.surface_color();
+            let light = crate::accent::light(surface_color);
+            let tint = if frosted {
+                self.config.tint
+            } else {
+                100.
+            };
+            if self.config.palette == "theme" {
+                let key = format!("{}:{}:{}", self.config.theme, r.right, r.bottom);
+                if self.theme_texture.as_ref().is_none_or(|(k, _)| *k != key) {
+                    self.theme_texture = render::Image::from_rgba(
+                        256,
+                        256,
+                        visuals::pixels(&self.config, 256, 256, w / h),
+                    )
+                    .map(|i| (key, i));
+                }
+            }
+            frame.paint_frosted_chrome_for(
+                self.hwnd,
+                frosted && wallpaper_available,
+                |chrome_dc| {
+                    let c = Canvas::new(chrome_dc, self.dpi);
+                    if self.config.palette == "theme" {
+                        if let Some((_, image)) = &self.theme_texture {
+                            // Legacy artwork remains recognizable even when frost is on.
+                            c.image_alpha(
+                                image,
+                                [0., 0., w, h],
+                                if frosted {
+                                    0.86 + 0.14 * tint / 100.
+                                } else {
+                                    1.
+                                },
+                            );
+                        }
+                    } else if !crate::surface::managed(&self.config.palette) {
+                        c.round(
+                            pane,
+                            radius,
+                            surface_color,
+                            (tint * 2.55).round() as u8,
+                            false,
+                            false,
+                        );
+                    }
+                    crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
+                    c.coating(pane, radius);
+                    c.draw_pane_overlay(
+                        [r.right as u32, r.bottom as u32],
+                        self.dpi,
+                        tint / 100.,
+                        light,
+                        [0., 0., w, h],
+                    );
+                    c.widget_corner_reflection_for(self.hwnd, pane, radius, light);
+                },
+            );
+            let l = crate::contrast::sample(frame.dc, self.dpi, [20., 20., w - 20., h - 20.]);
+            (self.ink, self.muted) = crate::contrast::inks(l, None);
+            let Some(bg) = self
+                .background
+                .take()
+                .filter(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
+                .or_else(|| Buffer::plain(r.right, r.bottom, self.dpi))
+            else {
+                return;
+            };
+            bg.copy_from(frame.dc);
+            self.background = Some(bg);
+            self.key = key;
+        } else {
+            frame.copy_from(self.background.as_ref().unwrap().dc);
+        }
+        let batch = render::AlphaBatch::new(frame.dc, self.dpi);
+        frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55).round() as u8);
+        {
+            let c = Canvas::new(frame.dc, self.dpi);
+            self.paint_content(frame.dc, w, h);
+            let header_action = |id: usize| {
+                if id == 0 {
+                    crate::settings_ui::HeaderAction::Settings
+                } else {
+                    crate::settings_ui::HeaderAction::Hide
+                }
+            };
+            crate::settings_ui::draw_widget_header(
+                frame.dc,
+                self.hwnd,
+                self.dpi,
+                w,
+                if self.config.theme == "sunset" {
+                    ""
+                } else {
+                    "Clock"
+                },
+                self.ink,
+                self.hover.map(header_action),
+                self.pressed.map(header_action),
+            );
+            if !self.error.is_empty() {
+                c.round(
+                    [12., h - 43., w - 12., h - 10.],
+                    8.,
+                    face::color("terminal"),
+                    245,
+                    false,
+                    false,
+                );
+                c.text(
+                    &self.error,
+                    [20., h - 42., w - 20., h - 11.],
+                    10.,
+                    false,
+                    0xe6e6ff,
+                    0,
+                );
+            }
+        }
+        let preserve = batch.is_some();
+        drop(batch);
+        if let Some(bg) = &self.background {
+            crate::settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, w);
+        }
+        frame.present_with_alpha(self.hwnd, preserve);
+        self.frame = Some(frame);
+        if self.resizing {
+            if let Some(shadow) = &self.shadow {
+                shadow.hide();
+            }
+        } else {
+            if self.shadow.is_none() {
+                self.shadow = WindowShadow::new(self.hwnd);
+            }
+            if let Some(shadow) = &mut self.shadow {
+                shadow.sync(
+                    self.hwnd,
+                    self.dpi,
+                    (self.config.opacity * 2.55).round() as u8,
+                );
+            }
+        }
+    }
+}
+fn xy(l: LPARAM) -> (i32, i32) {
+    ((l as u16 as i16) as i32, ((l >> 16) as u16 as i16) as i32)
+}
+unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_NCCALCSIZE || msg == WM_NCPAINT {
+        return 0;
+    }
+    if msg == WM_NCACTIVATE {
+        return 1;
+    }
+    if msg == WM_NCCREATE {
+        let create = &*(lp as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<State>;
+    if ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    if msg == WM_GETMINMAXINFO {
+        let dpi = (*ptr)
+            .try_borrow()
+            .map(|s| s.dpi)
+            .unwrap_or_else(|_| GetDpiForWindow(hwnd) as f32 / 96.);
+        let info = &mut *(lp as *mut MINMAXINFO);
+        info.ptMinTrackSize = POINT {
+            x: (MIN_SIZE as f32 * dpi).ceil() as i32,
+            y: (MIN_SIZE as f32 * dpi).ceil() as i32,
+        };
+        info.ptMaxTrackSize = POINT {
+            x: (MAX_SIZE as f32 * dpi).round() as i32,
+            y: (MAX_SIZE as f32 * dpi).round() as i32,
+        };
+        return 0;
+    }
+    let Ok(mut s) = (*ptr).try_borrow_mut() else {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    };
+    match msg {
+        WM_CREATE => {
+            s.hwnd = hwnd;
+            s.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
+            0
+        }
+        WM_PAINT => {
+            let frame_started = std::time::Instant::now();
+            let mut ps = zeroed();
+            BeginPaint(hwnd, &mut ps);
+            let visible = IsWindowVisible(hwnd) != 0;
+            if visible {
+                s.paint();
+            }
+            EndPaint(hwnd, &ps);
+            if visible && s.anim_clock.is_some() {
+                crate::motion::pace_vsync(
+                    hwnd,
+                    frame_started,
+                    &mut s.frame_queued,
+                    crate::motion::VSYNC_FRAME,
+                );
+            }
+            0
+        }
+        WM_ERASEBKGND => 1,
+        settings::SETTINGS_CHANGED => {
+            s.settings_changed();
+            0
+        }
+        m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
+            s.reload_from_shared();
+            0
+        }
+        WM_TIMER if wp == 99 => {
+            KillTimer(hwnd, 99);
+            s.save();
+            0
+        }
+        WM_TIMER if wp == ANIMATION => {
+            if afterglow::interval(
+                &s.config,
+                IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0,
+                s.moving,
+            )
+            .is_some()
+            {
+                if !s.frame_queued {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            } else {
+                KillTimer(hwnd, ANIMATION);
+                s.anim_clock = None;
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            s.frame_queued = false;
+            if afterglow::interval(
+                &s.config,
+                IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0,
+                s.moving,
+            )
+            .is_some()
+            {
+                InvalidateRect(hwnd, null(), 0);
+            } else {
+                KillTimer(hwnd, ANIMATION);
+                s.anim_clock = None;
+            }
+            0
+        }
+        WM_TIMER if wp == TICK => {
+            s.arm();
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_TIMECHANGE => {
+            s.arm();
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        m if m == WALLPAPER_READY => {
+            if s.glass.borrow_mut().finish_async() {
+                s.key.clear();
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            s.key.clear();
+            s.glass.borrow_mut().refresh();
+            let prev_dpi = s.dpi;
+            let live_dpi = crate::geometry::window_dpi(hwnd);
+            let pre_dpi_changed = (prev_dpi - live_dpi).abs() > 0.005;
+            s.dpi = live_dpi;
+            drop(s);
+            let (dpi, changed) =
+                crate::geometry::clamp_window_to_work(hwnd, [MIN_SIZE, MIN_SIZE], prev_dpi);
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                s.dpi = dpi;
+                if pre_dpi_changed || (s.dpi - dpi).abs() > 0.005 || changed {
+                    s.frame = None;
+                    s.background = None;
+                    s.key.clear();
+                }
+                s.save_bounds();
+            }
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_NCHITTEST => {
+            let (x, y) = xy(lp);
+            let mut p = POINT { x, y };
+            ScreenToClient(hwnd, &mut p);
+            let (w, h) = s.dimensions();
+            let x = p.x as f32 / s.dpi;
+            let y = p.y as f32 / s.dpi;
+            if crate::compositor::distance(x, y, w, h, 34., 4.) > 0. {
+                return HTTRANSPARENT as isize;
+            }
+            let edge = crate::geometry::widget_edge(x, y, w, h);
+            let hit = if edge != HTCLIENT {
+                edge
+            } else if s.hit(x, y).is_some() {
+                HTCLIENT
+            } else {
+                HTCAPTION
+            };
+            hit as isize
+        }
+        WM_ENTERSIZEMOVE => {
+            crate::widget_interaction::enter_size_move(&mut s.moving);
+            s.arm_animation();
+            0
+        }
+        WM_SIZING => {
+            {
+                let s = &mut *s;
+                crate::widget_interaction::start_resize(hwnd, &mut s.resizing, s.shadow.as_ref());
+            }
+            drop(s);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_EXITSIZEMOVE => {
+            let s = &mut *s;
+            crate::widget_interaction::exit_size_move(hwnd, &mut s.moving, &mut s.resizing);
+            s.arm_animation();
+            s.key.clear();
+            s.save_bounds();
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED => {
+            crate::widget_interaction::on_window_pos_changed(
+                &*(lp as *const WINDOWPOS),
+                s.resizing,
+                &mut s.shadow,
+                GetDpiForWindow(hwnd) as f32 / 96.,
+            );
+            drop(s);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_SHOWWINDOW if wp == 0 => {
+            KillTimer(hwnd, ANIMATION);
+            KillTimer(hwnd, TICK);
+            s.anim_clock = None;
+            drop(s);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            if crate::widget_interaction::should_paint_move(hwnd, s.resizing) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_SIZE => {
+            if wp as u32 == SIZE_MINIMIZED {
+                KillTimer(hwnd, ANIMATION);
+                s.anim_clock = None;
+            } else {
+                s.arm_animation();
+            }
+            if s.moving {
+                let s = &mut *s;
+                crate::widget_interaction::start_resize(hwnd, &mut s.resizing, s.shadow.as_ref());
+            }
+            if crate::widget_interaction::should_paint_resize(hwnd, s.moving, s.frame.is_some()) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_DPICHANGED => {
+            let new_dpi = ((wp as u16) as f32 / 96.).max(1.);
+            s.dpi = new_dpi;
+            s.key.clear();
+            s.frame = None;
+            s.background = None;
+            let r = crate::geometry::clamp_dpi_rect(*(lp as *const RECT), [MIN_SIZE, MIN_SIZE], new_dpi);
+            drop(s);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_MOUSEMOVE => {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut track);
+            let (x, y) = xy(lp);
+            let hit = s.hit(x as f32 / s.dpi, y as f32 / s.dpi);
+            if hit != s.hover {
+                s.hover = hit;
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        message
+            if message == windows_sys::Win32::UI::Controls::WM_MOUSELEAVE
+                || message == WM_NCMOUSEMOVE =>
+        {
+            if s.hover.take().is_some() {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            drop(s);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = xy(lp);
+            s.pressed = s.hit(x as f32 / s.dpi, y as f32 / s.dpi);
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = xy(lp);
+            let pressed = s.pressed.take();
+            let hit = s.hit(x as f32 / s.dpi, y as f32 / s.dpi);
+            ReleaseCapture();
+            if let Some(id) = pressed.filter(|p| Some(*p) == hit) {
+                s.action(id);
+            }
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            s.pressed = None;
+            if s.moving || s.resizing {
+                let st = &mut *s;
+                crate::widget_interaction::exit_size_move(hwnd, &mut st.moving, &mut st.resizing);
+                st.key.clear();
+            }
+            InvalidateRect(hwnd, null(), 0);
+            if msg == WM_CANCELMODE {
+                ReleaseCapture();
+                drop(s);
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            0
+        }
+        WM_CONTEXTMENU => {
+            s.open_settings();
+            0
+        }
+        WM_KEYDOWN => {
+            match wp {
+                0x1b => {
+                    s.pressed = None;
+                    ReleaseCapture();
+                }
+                0x25 | 0x27 => {
+                    let i = THEMES
+                        .iter()
+                        .position(|t| t.0 == s.config.theme)
+                        .unwrap_or(0);
+                    s.action(10 + if wp == 0x27 { (i + 1) % 9 } else { (i + 8) % 9 });
+                }
+                _ => {}
+            }
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_CLOSE => {
+            s.action(1);
+            0
+        }
+        WM_DESTROY => {
+            KillTimer(hwnd, TICK);
+            KillTimer(hwnd, ANIMATION);
+            s.settings.take();
+            s.shadow.take();
+            0
+        }
+        WM_NCDESTROY => {
+            crate::gpu::remove_surface(hwnd);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(s);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        _ => {
+            drop(s);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+    }
+}
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
+pub(crate) mod package;

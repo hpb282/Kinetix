@@ -1,0 +1,77 @@
+"""Build the user-authorized native Windows x64 portable ZIP (no installer)."""
+from __future__ import annotations
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tomllib
+import zipfile
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import run_native_dock as native
+
+def archive_portable(destination):
+    manifest=json.loads((destination/"kinetix-portable.json").read_text(encoding="utf-8"))
+    archive=destination.with_name(destination.name+".zip")
+    with zipfile.ZipFile(archive,"w",zipfile.ZIP_DEFLATED,strict_timestamps=False) as out:
+        for name,digest in sorted(manifest["files"].items()):
+            file=destination/name
+            if hashlib.sha256(file.read_bytes()).hexdigest()!=digest:raise RuntimeError(f"Changed bundle file: {name}")
+            out.write(file,name)
+        out.write(destination/"kinetix-portable.json","kinetix-portable.json")
+    archive.with_suffix(".zip.sha256").write_text(hashlib.sha256(archive.read_bytes()).hexdigest()+"  "+archive.name+"\n",encoding="utf-8")
+    print(archive)
+
+def main():
+    version = tomllib.loads(native.MANIFEST.read_text(encoding="utf-8"))["package"]["version"]
+    if "--archive-only" in sys.argv:
+        archive_portable(ROOT/"share"/f"Kinetix-{version}-windows-x86_64")
+        return
+    cargo, env = native.toolchain()
+    env["RUSTFLAGS"] = "-C target-feature=+crt-static"
+    env["CARGO_TARGET_DIR"] = str(ROOT / "native-dock/target/portable-debug")
+    subprocess.run([sys.executable, "scripts/check_safe.py"], cwd=ROOT, check=True)
+    subprocess.run([cargo, "build", "--locked", "--manifest-path", str(native.MANIFEST)], env=env, cwd=ROOT, check=True)
+    destination = ROOT / "share" / f"Kinetix-{version}-windows-x86_64"
+    if (destination / "kinetix-portable.json").exists() and "--refresh" not in sys.argv:
+        raise RuntimeError(f"Output already exists; keep it or move it before rebuilding: {destination}")
+    if (destination / "config").exists():
+        raise RuntimeError("Build output contains user data; use a fresh output folder instead of repackaging it")
+    destination.mkdir(parents=True, exist_ok=True)
+
+    def copy(source, name):
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    copy(Path(env["CARGO_TARGET_DIR"]) / "debug/kinetix.exe", "Kinetix.exe")
+    copy(ROOT / "LICENSE.txt", "LICENSE.txt")
+    copy(ROOT / "resources/tray.png", "resources/tray.png")
+    copy(ROOT / "native-dock/kinetix.manifest", "resources/kinetix.manifest")
+    # runtime/ is allowed by the original portable updater, preserving upgrades.
+    copy(ROOT / "scripts/portable_python/launch_kinetix.py", "runtime/launch_kinetix.py")
+    copy(ROOT / "scripts/portable_python/Launch Kinetix.pyw", "runtime/Launch Kinetix.pyw")
+    (destination / "LICENSES").mkdir(exist_ok=True)
+    # Include Rust dependency license texts rather than removing third-party notices.
+    metadata = json.loads(subprocess.check_output([cargo, "metadata", "--locked", "--format-version", "1", "--manifest-path", str(native.MANIFEST)], env=env))
+    from third_party import collect
+    collect(destination/"LICENSES",metadata=metadata)
+    for manifest in (ROOT / "widgets").glob("*/widget.json"):
+        copy(manifest, manifest.relative_to(ROOT).as_posix())
+    readme = """# Kinetix portable\n\nExtract the entire ZIP to a writable folder, then double-click Kinetix.exe.\nNo Python, Rust, Visual Studio or Node installation is needed. Music playback\nruns natively in Rust and requires installed Chrome or Edge and internet access.\nOther widgets do not require a browser.\n\nTarget: Windows 10/11 x64. ARM64 native and 32-bit builds are not provided.\nThis build has not yet been certified on a clean Windows VM or other PCs.\n\nKeep the full folder together. User data is stored in config/ next to Kinetix.exe.\nUse a folder you can write to, such as Downloads or your user tools folder,\nnot Program Files. Settings enable Start with Windows by default; you can turn\nit off. Moving the folder requires launching Kinetix once to refresh that entry.\n\nGeneral Settings > Updates checks official GitHub Releases. Download update\nthen Restart and apply update. Settings, notes, browser profile and geometry\nare preserved. All six native widget implementations update with the app.\nIndependent downloadable native plugins are not implemented yet.\n\nThe package is not code-signed. Windows may show an unknown-publisher warning.\nSource and release notes: https://github.com/hpb282/Kinetix\nBased on Lumen by Nhat Ng: https://github.com/nhatnguyends/Lumen\n"""
+    readme += "\nOptional Python entry point (requires installed Python 3.10+):\nRun `python runtime/launch_kinetix.py`, or double-click `runtime/Launch Kinetix.pyw`\nif .pyw files are associated with Python. This starts the same Kinetix.exe; keep\nit and all runtime files. It does not change Defender or company security policy.\nLogs: config/logs/python-launcher.log. No pip packages or source build required.\n"
+    readme += "\nKinetix by hpb282 — copyright 2026 hpb282. Based on Lumen by Nhat Ng —\ncopyright 2026 Nhat Ng. MIT License: LICENSE.txt.\nThanks to all upstream developers. General Settings > Credits & licenses opens\nthe acknowledgements; full third-party license texts and inventory are in LICENSES/.\nLibraries/assets retain their own licenses, independently of Kinetix's MIT license.\n"
+    (destination / "README.md").write_text(readme, encoding="utf-8")
+    files = {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in sorted(destination.rglob("*")) if p.is_file() and p.name != "kinetix-portable.json"}
+    manifest = {"schemaVersion": 1, "version": version, "target": "windows-x86_64", "files": files}
+    (destination / "kinetix-portable.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    archive_portable(destination)
+
+
+if __name__ == "__main__":
+    main()

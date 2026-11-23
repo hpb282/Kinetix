@@ -1,0 +1,354 @@
+//! Last visible music session, loaded locally before the first widget frame.
+//! This is display state only: loading it never starts a browser or playback.
+use super::*;
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, fs};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct Snapshot {
+    version: u32,
+    pub playback: Playback,
+    pub art_files: BTreeMap<String, String>,
+    pub last_cover: Option<String>,
+}
+pub(super) const MAX_ART_FILES: usize = 40;
+
+pub(super) fn valid_file(file: &str) -> bool {
+    file.len() == 68
+        && file.ends_with(".img")
+        && file.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit)
+}
+
+pub(super) fn prune_art_dir(art_dir: &Path, max_files: usize) {
+    let Ok(entries) = fs::read_dir(art_dir) else {
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| valid_file(&entry.file_name().to_string_lossy()))
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if files.len() <= max_files {
+        return;
+    }
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, path) in files.into_iter().skip(max_files) {
+        let _ = fs::remove_file(path);
+    }
+}
+impl Snapshot {
+    pub fn load(root: &Path) -> Option<Self> {
+        let dir = root.join("config/native-music-player");
+        let file = dir.join("last-view.json");
+        let mut result: Self = if file.exists() {
+            if fs::metadata(&file).ok()?.len() > 256 * 1024 {
+                return None;
+            }
+            serde_json::from_slice(&fs::read(file).ok()?).ok()?
+        } else {
+            // Older versions cached images but not the URL/metadata manifest.
+            // Retain their most recent decodable artwork without inventing a
+            // title, artist, queue or playable track association.
+            let mut files: Vec<_> = fs::read_dir(dir.join("art"))
+                .ok()?
+                .filter_map(Result::ok)
+                .filter(|entry| valid_file(&entry.file_name().to_string_lossy()))
+                .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+                .collect();
+            files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+            let path = files.into_iter().take(20).map(|e| e.1).find(|path| {
+                image::ImageReader::open(path)
+                    .ok()
+                    .and_then(|r| r.with_guessed_format().ok())
+                    .and_then(|mut r| {
+                        let mut limits = image::Limits::default();
+                        limits.max_alloc = Some(32 * 1024 * 1024);
+                        r.limits(limits);
+                        r.decode().ok()
+                    })
+                    .is_some()
+            })?;
+            let name = path.file_name()?.to_str()?.to_owned();
+            let url = format!("cached:{name}");
+            Self {
+                version: 1,
+                playback: Playback {
+                    art: Some(url.clone()),
+                    ..Playback::default()
+                },
+                art_files: BTreeMap::from([(url.clone(), name)]),
+                last_cover: Some(url),
+            }
+        };
+        if result.version != 1 {
+            return None;
+        }
+        result.art_files.retain(|url, name| {
+            url.len() <= 8192 && valid_file(name) && dir.join("art").join(name).is_file()
+        });
+        if result.art_files.len() > 128 {
+            return None;
+        }
+        result.last_cover = result
+            .last_cover
+            .filter(|url| result.art_files.contains_key(url));
+        if result.last_cover.is_none() {
+            result.last_cover = result
+                .playback
+                .art
+                .clone()
+                .filter(|url| result.art_files.contains_key(url));
+        }
+        result.playback.queue.truncate(60);
+        result
+            .playback
+            .title
+            .truncate(result.playback.title.floor_char_boundary(2048));
+        result
+            .playback
+            .artist
+            .truncate(result.playback.artist.floor_char_boundary(2048));
+        if !result.playback.duration.is_finite() {
+            result.playback.duration = 0.;
+        }
+        result.playback.duration = result.playback.duration.clamp(0., 86400.);
+        result.playback.position = 0.;
+        result.playback.available = false;
+        result.playback.playing = false;
+        result.playback.can_next = false;
+        result.playback.can_previous = false;
+        result.playback.can_seek = false;
+        result.playback.error = None;
+        prune_art_dir(&dir.join("art"), MAX_ART_FILES);
+        Some(result)
+    }
+    fn save(&self, root: &Path) -> Result<(), String> {
+        let dir = root.join("config/native-music-player");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        prune_art_dir(&dir.join("art"), MAX_ART_FILES);
+        let file = dir.join("last-view.json");
+        let tmp = dir.join("last-view.json.tmp");
+        fs::write(&tmp, serde_json::to_vec(self).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        unsafe {
+            use windows_sys::Win32::Storage::FileSystem::*;
+            if MoveFileExW(
+                wide(&tmp).as_ptr(),
+                wide(&file).as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        Ok(())
+    }
+}
+impl State {
+    pub(super) fn accept_playback(&mut self, mut next: Playback) {
+        // No browser/loading navbar is unknown, not a logout. Preserve the
+        // confirmed account alongside cached art until a live check says otherwise.
+        if !next.auth_known && !next.signed_in {
+            next.signed_in = self.playback.signed_in;
+        }
+        let account_changed = self.playback.signed_in != next.signed_in;
+        self.playback.signed_in = next.signed_in;
+        if account_changed {
+            self.sync_settings();
+        }
+        let seeking = self
+            .last_seek
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(2500));
+        // Loading/disconnection must not erase the previous session's artwork
+        // or metadata. Transport capabilities always describe the live player.
+        if !next.available && !self.playback.title.is_empty() {
+            if seeking {
+                return;
+            }
+            self.playback.available = false;
+            self.playback.playing = false;
+            self.playback.can_seek = false;
+            self.playback.can_next = false;
+            self.playback.can_previous = false;
+            return;
+        }
+        let same_track =
+            next.video_id == self.playback.video_id && next.title == self.playback.title;
+        if self.pressed == Some(Action::Seek) && same_track {
+            next.position = self.playback.position;
+        } else if seeking && same_track {
+            // Keep the seeked position while the player buffers/applies the seek,
+            // and release the hold as soon as the reported position catches up.
+            if (next.position - self.playback.position).abs() > 2.5 {
+                next.position = self.playback.position;
+            } else {
+                self.last_seek = None;
+            }
+        }
+        if seeking && next.video_id == self.playback.video_id {
+            next.playing = next.playing || self.playback.playing;
+            next.can_next = next.can_next || self.playback.can_next;
+            next.can_previous = next.can_previous || self.playback.can_previous;
+            next.can_seek = next.can_seek || self.playback.can_seek;
+        }
+        if next.art.as_ref().is_none_or(|a| a.is_empty()) {
+            next.art = self.playback.art.clone();
+        }
+        for track in &mut next.queue {
+            if track.thumb.is_empty() {
+                if let Some(old) = self
+                    .playback
+                    .queue
+                    .iter()
+                    .find(|t| t.video_id == track.video_id)
+                {
+                    track.thumb = old.thumb.clone();
+                }
+            }
+        }
+        if self.config.design == "coverflow"
+            && !self.playback.video_id.is_empty()
+            && !next.video_id.is_empty()
+            && self.playback.video_id != next.video_id
+        {
+            let old_id = &self.playback.video_id;
+            let new_id = &next.video_id;
+            let delta = next
+                .queue
+                .iter()
+                .position(|t| t.video_id == *old_id)
+                .and_then(|old_i| {
+                    next.queue
+                        .iter()
+                        .position(|t| t.video_id == *new_id)
+                        .map(|new_i| new_i as i32 - old_i as i32)
+                })
+                .or_else(|| {
+                    self.playback
+                        .queue
+                        .iter()
+                        .position(|t| t.video_id == *new_id)
+                        .and_then(|new_i| {
+                            self.playback
+                                .queue
+                                .iter()
+                                .position(|t| t.video_id == *old_id)
+                                .map(|old_i| new_i as i32 - old_i as i32)
+                        })
+                })
+                .unwrap_or(0)
+                .clamp(-3, 3);
+            if delta != 0 {
+                let current_shift = self
+                    .coverflow_anim
+                    .filter(|a| !a.finished())
+                    .map_or(0., |a| a.remaining());
+                self.coverflow_anim = Some(coverflow::Transition {
+                    offset: (current_shift + delta as f32).clamp(-3., 3.),
+                    started: Instant::now(),
+                });
+            }
+        }
+        self.playback = next;
+        self.received = Instant::now();
+    }
+    pub(super) fn cover_image(&self, url: &str) -> Option<&Image> {
+        self.images.get(url).or_else(|| {
+            let is_current = url.is_empty() || Some(url) == self.playback.art.as_deref();
+            if is_current {
+                self.last_cover
+                    .as_ref()
+                    .and_then(|old| self.images.get(old))
+            } else {
+                None
+            }
+        })
+    }
+    pub(super) fn remember_view(&mut self) {
+        if self.smoke || !self.playback.available || self.last_cover.is_none() {
+            return;
+        }
+        let files: BTreeMap<_, _> = self
+            .art_files
+            .iter()
+            .filter(|(url, name)| {
+                valid_file(name)
+                    && (self.last_cover.as_ref() == Some(*url)
+                        || self.playback.art.as_ref() == Some(*url)
+                        || self.playback.queue.iter().any(|t| t.thumb == url.as_str()))
+            })
+            .take(128)
+            .map(|(u, f)| (u.clone(), f.clone()))
+            .collect();
+        let mut playback = self.playback.clone();
+        playback.position = 0.;
+        playback.playing = false;
+        playback.available = false;
+        playback.can_seek = false;
+        playback.can_next = false;
+        playback.can_previous = false;
+        playback.error = None;
+        let snapshot = Snapshot {
+            version: 1,
+            playback,
+            art_files: files,
+            last_cover: self.last_cover.clone(),
+        };
+        if let Ok(signature) = serde_json::to_string(&snapshot) {
+            if signature != self.session_signature {
+                match snapshot.save(&self.root) {
+                    Ok(()) => self.session_signature = signature,
+                    Err(e) => eprintln!("native-music last-view: {e}"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn last_session_restores_covers_but_never_live_transport_flags() {
+        let root = std::env::temp_dir().join(format!("kinetix-music-session-{}", std::process::id()));
+        let dir = root.join("config/native-music-player/art");
+        fs::create_dir_all(&dir).unwrap();
+        let name = format!("{}.img", "a".repeat(64));
+        fs::write(dir.join(&name), b"cached image").unwrap();
+        let snapshot = Snapshot {
+            version: 1,
+            playback: Playback {
+                title: "Previous song".into(),
+                artist: "Previous artist".into(),
+                art: Some("https://i.ytimg.com/art".into()),
+                available: true,
+                playing: true,
+                can_seek: true,
+                can_next: true,
+                ..Playback::default()
+            },
+            art_files: BTreeMap::from([("https://i.ytimg.com/art".into(), name)]),
+            last_cover: Some("https://i.ytimg.com/art".into()),
+        };
+        snapshot.save(&root).unwrap();
+        let restored = Snapshot::load(&root).unwrap();
+        assert_eq!(restored.playback.title, "Previous song");
+        assert!(restored.last_cover.is_some());
+        assert!(
+            !restored.playback.available
+                && !restored.playback.playing
+                && !restored.playback.can_seek
+                && !restored.playback.can_next
+        );
+        assert!(!valid_file("../../outside.img"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn max_art_files_accommodates_coverflow_cache() {
+        assert!(MAX_ART_FILES >= 40);
+    }
+}
